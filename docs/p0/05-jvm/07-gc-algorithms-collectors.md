@@ -176,38 +176,123 @@ CMS 是 Concurrent Mark Sweep，目标是降低老年代回收停顿。它主要
 
 ## G1
 
-G1 是 Garbage First，目标是在可控停顿时间内获得较好的吞吐。G1 将堆划分为多个 Region，不再是传统连续新生代和老年代布局。
+G1 是 Garbage First，目标是在可控停顿时间内获得较好的吞吐。它不是按一整块连续新生代、老年代来管理堆，而是把堆切成多个大小相同的 Region，再按 Region 粒度做分配、统计和回收。
+
+G1 的核心思路：
+
+> 不一定一次回收整个老年代，而是估算每个 Region 的回收收益和回收成本，在停顿时间预算内优先回收收益最高的一批 Region。
 
 核心特点：
 
 - Region 化堆布局。
 - 每个 Region 可扮演 Eden、Survivor、Old、Humongous 等角色。
-- 通过回收价值选择垃圾最多、收益最高的 Region。
-- 支持 Young GC、并发标记、Mixed GC。
-- 面向可预测停顿。
+- 年轻代和老年代在逻辑上仍然存在，但物理上不要求连续。
+- 通过 CSet 选择本次回收的 Region，尽量满足停顿目标。
+- 通过复制转移回收对象，回收后 Region 可整体复用，因此碎片问题比 CMS 少。
+- 支持 Young GC、并发标记、Mixed GC，必要时也可能退化为 Full GC。
+
+### Region 和对象分配
+
+G1 会把堆划分为多个 Region，例如 1MB、2MB、4MB、8MB 等，具体大小由堆大小和参数决定。一个 Region 在某一时刻可以是：
+
+- Eden Region：新对象优先分配到这里。
+- Survivor Region：Young GC 后仍存活的年轻对象进入这里。
+- Old Region：年龄足够或 Survivor 放不下的对象晋升到这里。
+- Humongous Region：大对象专用 Region。
+
+普通对象分配路径通常是：
+
+1. 线程优先在 Eden 中的 TLAB 分配。
+2. TLAB 不够时申请新的 TLAB 或走慢路径。
+3. Eden Region 用到一定程度后触发 Young GC。
+4. Young GC 把存活对象复制到 Survivor 或 Old Region。
+5. 被回收的 Eden Region 整体变为空闲 Region。
+
+所以 G1 不是在原地清理年轻代对象，而是把存活对象转移出去，再整块回收原 Region。这也是它相比标记-清除更不容易产生碎片的原因。
+
+### Young GC
+
+Young GC 是 STW。触发原因通常是 Eden 空间不足。它主要做：
+
+1. 选择所有 Eden Region 和部分 Survivor Region 作为 CSet。
+2. 扫描 GC Roots 和相关跨 Region 引用。
+3. 把 CSet 中仍存活的对象复制到新的 Survivor 或 Old Region。
+4. 回收整个 CSet 中原来的 Region。
+
+G1 会根据停顿目标动态调整年轻代 Region 数量。年轻代越大，吞吐可能更好，但单次 Young GC 停顿也可能变长；年轻代越小，单次停顿可能更短，但 GC 更频繁。
+
+### 并发标记周期
+
+G1 需要知道老年代各 Region 的存活比例，才能判断哪些 Old Region 回收收益高。因此会周期性做并发标记。
 
 主要阶段：
 
-1. Young GC：回收年轻 Region。
-2. 并发标记：识别老年代 Region 存活情况。
-3. Remark：STW，完成标记修正。
-4. Cleanup：统计和清理。
-5. Mixed GC：回收年轻 Region 加部分老年代高收益 Region。
+1. Initial Mark：STW，标记 GC Roots 直接可达对象，通常借一次 Young GC 顺带完成。
+2. Root Region Scan：扫描 Survivor Region 中指向老年代的引用，不能和下一次 Young GC 并发。
+3. Concurrent Mark：与用户线程并发，遍历对象图，统计各 Region 存活情况。
+4. Remark：STW，处理并发标记期间的引用变化，完成标记修正。
+5. Cleanup：统计 Region 回收收益，清理完全没有存活对象的 Region。
+
+并发标记结束后，G1 才知道哪些 Old Region 垃圾比例高，后续才能进入 Mixed GC。
+
+### Mixed GC
+
+Mixed GC 也是 STW。它和 Young GC 的区别是：
+
+- Young GC：只回收年轻 Region。
+- Mixed GC：回收年轻 Region，同时挑选一部分高收益 Old Region。
+
+G1 不会一次性把所有可回收 Old Region 都收掉，而是分多次 Mixed GC 慢慢回收。这样做是为了把每次停顿控制在目标范围内。
+
+如果 Mixed GC 跟不上对象分配速度，或者老年代空间不足，可能出现 evacuation failure、to-space exhausted，严重时退化为 Full GC。
 
 关键机制：
 
-- Remembered Set：记录跨 Region 引用，避免每次扫描全堆。
-- Collection Set：本次计划回收的 Region 集合。
-- SATB：Snapshot-At-The-Beginning，并发标记时维持快照语义。
-- Humongous Object：超过 Region 一半的大对象会特殊处理，可能影响 GC。
+- Remembered Set：每个 Region 维护“有哪些其他 Region 引用了我”，避免回收一个 Region 时扫描全堆。
+- Collection Set：本次计划回收的 Region 集合，Young GC 主要包含年轻 Region，Mixed GC 还包含部分 Old Region。
+- Pause Prediction：根据历史回收速度、复制成本、RSet 扫描成本估算停顿时间，并选择合适的 CSet。
+- SATB：Snapshot-At-The-Beginning，并发标记按“开始标记那一刻”的对象图近似做快照，写屏障会记录被覆盖前的旧引用。
+- Humongous Object：超过 Region 一半的大对象会直接进入 Humongous Region，通常连续占用一个或多个 Region。
+
+### RSet 为什么重要
+
+Region 化以后，如果回收某个 Region，必须知道堆里哪些地方引用了这个 Region 中的对象。最粗暴的办法是扫描全堆，但这会让停顿不可控。
+
+RSet 解决的是：
+
+> 回收一个 Region 时，只扫描和它相关的跨 Region 引用，而不是扫描整个堆。
+
+代价是：
+
+- 写对象引用时需要写屏障维护 RSet。
+- 跨 Region 引用很多时，RSet 会变大。
+- RSet 扫描和维护都会消耗 CPU 和内存。
+
+所以 G1 在对象引用关系复杂、跨 Region 引用特别多的场景下，效果可能变差。
+
+### Humongous Object
+
+对象大小超过一个 Region 的一半时，会被 G1 作为 Humongous Object 处理。例如 Region 是 4MB，大于 2MB 的对象就属于 Humongous Object。
+
+特点：
+
+- 会占用连续的 Humongous Region。
+- 生命周期较短的大对象会增加 GC 压力。
+- 连续 Region 不够时可能更容易触发 Full GC。
+- 常见来源包括大数组、大字符串、大 byte buffer、一次性加载大响应。
+
+排查时如果 GC 日志中 Humongous 分配频繁，需要关注大对象来源，而不是只调 `MaxGCPauseMillis`。
 
 常用参数：
 
 ```bash
 -XX:+UseG1GC
--XX:MaxGCPauseMillis=200
--XX:G1HeapRegionSize=<size>
--XX:InitiatingHeapOccupancyPercent=45
+-XX:MaxGCPauseMillis=200              # 停顿目标，不是硬保证
+-XX:G1HeapRegionSize=<size>           # Region 大小
+-XX:InitiatingHeapOccupancyPercent=45  # 触发并发标记的老年代占用阈值
+-XX:G1ReservePercent=10                # 预留空闲空间，降低转移失败风险
+-XX:ParallelGCThreads=<n>              # STW 阶段并行 GC 线程数
+-XX:ConcGCThreads=<n>                  # 并发标记线程数
 ```
 
 优点：
@@ -215,6 +300,8 @@ G1 是 Garbage First，目标是在可控停顿时间内获得较好的吞吐。
 - 适合多核、大堆、在线服务。
 - 停顿目标相对可控。
 - 相比 CMS 更少碎片问题。
+- 不需要像 CMS 那样依赖标记-清除后的空闲列表处理大量碎片。
+- JDK 9 以后是 HotSpot 默认收集器，生产资料和工具支持丰富。
 
 缺点：
 
@@ -222,6 +309,16 @@ G1 是 Garbage First，目标是在可控停顿时间内获得较好的吞吐。
 - 参数和日志理解复杂。
 - 超大对象、跨 Region 引用多时效果可能变差。
 - 停顿目标不是硬保证。
+- 并发标记和写屏障会带来 CPU 成本。
+- 堆太小、分配速率过高或存活对象过多时，仍可能 Full GC。
+
+常见排查点：
+
+- Young GC 频繁：看分配速率、Eden 大小、对象创建热点。
+- Mixed GC 频繁：看老年代增长、对象存活率、缓存和集合持有。
+- Evacuation Failure / To-space Exhausted：看堆是否太小、预留空间是否不足、晋升压力是否过大。
+- Humongous Allocation：看大对象来源，优先从业务对象大小和批量处理方式入手。
+- RSet 扫描耗时高：看跨 Region 引用是否复杂，例如大 Map、大缓存、长生命周期对象引用大量短生命周期对象。
 
 ## ZGC
 
@@ -335,6 +432,18 @@ CMS 主要使用标记-清除，不移动存活对象，清理后会留下不连
 ### G1 为什么叫 Garbage First？
 
 G1 会根据 Region 的垃圾比例、回收成本和预期收益选择回收集合，优先回收收益高的 Region，而不是一次性回收整个老年代。
+
+### G1 为什么比 CMS 更不容易碎片化？
+
+CMS 主要是标记-清除，清理后对象不移动，容易留下不连续空闲块。G1 回收 CSet 时会把存活对象复制到其他 Region，再把原 Region 整体释放，因此天然带有整理效果。
+
+### G1 的 RSet 解决什么问题？
+
+RSet 记录跨 Region 引用。回收某个 Region 时，G1 只需要扫描 GC Roots 和相关 RSet，不必每次扫描全堆。代价是写屏障、RSet 维护和扫描会带来额外 CPU 与内存开销。
+
+### G1 的 Mixed GC 回收整个老年代吗？
+
+不是。Mixed GC 会回收所有年轻 Region，再选择一部分垃圾比例高、回收收益大的 Old Region。它通常分多次完成老年代回收，用多次较短停顿替代一次长时间 Full GC。
 
 ### G1 的停顿目标是硬限制吗？
 
